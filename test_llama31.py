@@ -3,11 +3,13 @@ Outputs the same thing as reference.py
 $ python test_llama31.py
 """
 
-import fire
 import time
+
+import fire
 import torch
 
 from llama31 import Llama
+
 
 def test_inference(
     ckpt_dir: str = "llama-models/models/llama3_1/Meta-Llama-3.1-8B",
@@ -31,7 +33,7 @@ def test_inference(
         plush girafe => girafe peluche
         cheese =>""",
     ]
-    max_batch_size = len(prompts) # 4
+    max_batch_size = len(prompts)  # 4
 
     # init the model
     llama = Llama.build(
@@ -39,11 +41,11 @@ def test_inference(
         tokenizer_path=tokenizer_path,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        flash=False, # disable flash attention so we can get exact match to reference
+        flash=False,  # disable flash attention so we can get exact match to reference
     )
 
     # sample
-    sample_rng = torch.Generator(device='cuda')
+    sample_rng = torch.Generator(device='mps')
     sample_rng.manual_seed(1337)
     t0 = time.time()
     results = llama.text_completion(
@@ -60,6 +62,7 @@ def test_inference(
         print(prompt, end="")
         print(f"{result['generation']}")
         print("\n==================================\n")
+
 
 if __name__ == "__main__":
     fire.Fire(test_inference)

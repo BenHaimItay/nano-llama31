@@ -16,8 +16,6 @@ torchrun --nnodes 1 --nproc_per_node 1 reference.py \
     --tokenizer_path llama-models/models/llama3_1/Meta-Llama-3.1-8B/tokenizer.model
 """
 
-from typing import List
-import fire
 import json
 import os
 import sys
@@ -25,6 +23,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, TypedDict
 
+import fire
 import torch
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.initialize import (
@@ -37,14 +36,21 @@ from fairscale.nn.model_parallel.initialize import (
 # from llama.model import ModelArgs, Transformer
 # from llama.tokenizer import ChatFormat, Dialog, Message, Tokenizer
 # new imports
-from llama_models.llama3_1.api import ModelArgs
-from llama_models.llama3_1.api import Transformer
-from llama_models.llama3_1.api import Tokenizer
+from llama_models.llama3_1.api import ModelArgs, Tokenizer, Transformer
+
+if torch.backends.mps.is_available():
+    device = torch.device('mps')
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
+
 
 class CompletionPrediction(TypedDict, total=False):
     generation: str
     tokens: List[str]  # not required
     logprobs: List[float]  # not required
+
 
 class Llama:
     @staticmethod
@@ -78,19 +84,23 @@ class Llama:
             This method initializes the distributed process group, sets the device to CUDA,
             and loads the pre-trained model and tokenizer.
         """
-        assert 1 <= max_seq_len <= 8192, f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
+        assert (
+            1 <= max_seq_len <= 8192
+        ), f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
         assert os.path.isdir(ckpt_dir), f"Checkpoint directory '{ckpt_dir}' does not exist."
         assert os.path.isfile(tokenizer_path), f"Tokenizer file '{tokenizer_path}' does not exist."
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
+            torch.distributed.init_process_group("gloo")
         if not model_parallel_is_initialized():
             if model_parallel_size is None:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
+
+        if device == 'cude':
+            torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
         torch.manual_seed(seed)
@@ -117,12 +127,17 @@ class Llama:
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         assert model_args.vocab_size == tokenizer.n_words
-        if torch.cuda.is_bf16_supported():
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+
+        if device == "cuda":
+            if torch.cuda.is_bf16_supported():
+                torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+            else:
+                torch.set_default_tensor_type(torch.cuda.HalfTensor)
         else:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+            torch.set_default_tensor_type(torch.HalfTensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        model.to(device)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -173,14 +188,14 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
         if min_prompt_len == total_len:
@@ -204,9 +219,7 @@ class Llama:
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
@@ -215,9 +228,7 @@ class Llama:
                     reduction="none",
                     ignore_index=pad_id,
                 )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (torch.isin(next_token, stop_tokens))
             prev_pos = cur_pos
             if all(eos_reached):
                 break
@@ -297,6 +308,7 @@ class Llama:
             ]
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
+
 def sample_top_p(probs, p, generator):
     """
     Perform top-p (nucleus) sampling on a probability distribution.
@@ -320,6 +332,7 @@ def sample_top_p(probs, p, generator):
     next_token = torch.multinomial(probs_sort, num_samples=1, generator=generator)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
 
 # -----------------------------------------------------------------------------
 def main(
@@ -369,12 +382,13 @@ def main(
         top_p=top_p,
     )
     for prompt, result in zip(prompts, results):
-        print(prompt, end="") # AK: change end="\n" to end=""
+        print(prompt, end="")  # AK: change end="\n" to end=""
         print(f"{result['generation']}")
         print("\n==================================\n")
 
     # AK: added clean up torch.distributed
     torch.distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     fire.Fire(main)

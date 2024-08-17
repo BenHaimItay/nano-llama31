@@ -13,24 +13,26 @@ python llama31.py \
     --tokenizer_path llama-models/models/llama3_1/Meta-Llama-3.1-8B/tokenizer.model
 """
 
-import os
 import glob
-import fire
-import time
 import json
 import math
-from pathlib import Path
+import os
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, TypedDict
-import torch
-from torch import nn
-import torch.nn.functional as F
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import fire
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 from tokenizer import Tokenizer
 
 # -----------------------------------------------------------------------------
 # ModelArgs
+
 
 @dataclass
 class ModelArgs:
@@ -46,7 +48,7 @@ class ModelArgs:
     use_scaled_rope: bool = False
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    flash: bool = False # use flash attention?
+    flash: bool = False  # use flash attention?
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -58,8 +60,10 @@ class ModelArgs:
         assert self.n_heads % self.n_kv_heads == 0
         assert self.dim % self.n_heads == 0
 
+
 # -----------------------------------------------------------------------------
 # Transformer
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -73,6 +77,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+
 
 def apply_scaling(freqs: torch.Tensor):
     # RoPE scaling (values obtained from grid search)
@@ -97,6 +102,7 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
@@ -106,12 +112,14 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
+
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
+
 
 def apply_rotary_emb(
     xq: torch.Tensor,
@@ -137,27 +145,32 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         # model_parallel_size = fs_init.get_model_parallel_world_size()
-        model_parallel_size = 1 # AK: model parallel size is 1 for 1 GPU
+        model_parallel_size = 1  # AK: model parallel size is 1 for 1 GPU
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False )
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         # TODO: only use cache on demand, and do lazy init to save memory
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        self.cache_k = torch.zeros(
+            (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        ).cuda()
 
-        self.flash = args.flash # use flash attention?
+        self.flash = args.flash  # use flash attention?
 
     def forward(
         self,
@@ -209,6 +222,7 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
+
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -229,6 +243,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -257,6 +272,7 @@ class TransformerBlock(nn.Module):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -316,7 +332,7 @@ class Transformer(nn.Module):
         mask = torch.full((seqlen, seqlen), float("-inf"), device=inputs.device)
         mask = torch.triu(mask, diagonal=1)
         mask = mask.type_as(h)
-        start_pos = -1 # -1 disables KV caching logic
+        start_pos = -1  # -1 disables KV caching logic
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
@@ -330,7 +346,9 @@ class Transformer(nn.Module):
         )
         return loss
 
-    def configure_optimizers(self, learning_rate, weight_decay=0.0, betas=(0.9, 0.97), device_type='cuda'):
+    def configure_optimizers(
+        self, learning_rate, weight_decay=0.0, betas=(0.9, 0.97), device_type='cuda'
+    ):
         train_params = []
 
         finetune_type = "all"
@@ -364,14 +382,16 @@ class Transformer(nn.Module):
         print("number of parameters: ", sum(p.numel() for p in self.parameters()))
         print("number of trainable parameters: ", sum(p.numel() for p in train_params))
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = True #'fused' in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = True  #'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(train_params, lr=learning_rate, betas=betas, **extra_args)
         return optimizer
 
+
 # -----------------------------------------------------------------------------
 # Llama wrapper
+
 
 class Llama:
 
@@ -385,13 +405,15 @@ class Llama:
         model_parallel_size: Optional[int] = 1,
         seed: int = 1,
     ) -> "Llama":
-        assert 1 <= max_seq_len <= 8192, f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
+        assert (
+            1 <= max_seq_len <= 8192
+        ), f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
         assert os.path.isdir(ckpt_dir), f"Checkpoint directory '{ckpt_dir}' does not exist."
         assert os.path.isfile(tokenizer_path), f"Tokenizer file '{tokenizer_path}' does not exist."
 
         local_rank = 0
-        torch.cuda.set_device(local_rank)
-        torch.manual_seed(seed) # seed must be the same in all processes
+        # torch.cuda.set_device(local_rank)
+        torch.manual_seed(seed)  # seed must be the same in all processes
 
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
@@ -474,13 +496,9 @@ class Llama:
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
             tokens[:, cur_pos] = next_token
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (torch.isin(next_token, stop_tokens))
             prev_pos = cur_pos
             if all(eos_reached):
                 break
@@ -526,6 +544,7 @@ class Llama:
         completions = [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
         return completions
 
+
 def sample_top_p(probs, p, generator):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
@@ -536,32 +555,36 @@ def sample_top_p(probs, p, generator):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
+
 # -----------------------------------------------------------------------------
 # distributed and sharded data loader
+
 
 def _peek_data_shard(filename):
     # only reads the header, returns header data
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
     if header[0] != 20240801:
         print("ERROR: magic number mismatch in the data .bin file!")
         exit(1)
     assert header[1] == 7, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+    ntok = header[2]  # number of tokens (claimed)
+    return ntok  # for now just return the number of tokens
+
 
 def _load_data_shard(filename):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
         assert header[0] == 20240801, "magic number mismatch in the data .bin file"
         assert header[1] == 7, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
+        ntok = header[2]  # number of tokens (claimed)
         # the rest of it are tokens, stored as uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint32)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
+
 
 class DistributedShardedDataLoader:
     """
@@ -572,6 +595,7 @@ class DistributedShardedDataLoader:
     of the dataset on disk, so the user should make sure to shuffle their examples
     during the creation of their data shards for best performance.
     """
+
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -580,7 +604,9 @@ class DistributedShardedDataLoader:
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+        assert (
+            len(self.files) > 0
+        ), f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
         ntok_total = 0
@@ -603,7 +629,7 @@ class DistributedShardedDataLoader:
             self.tokens = _load_data_shard(self.files[self.current_shard])
         self.current_position = self.process_rank * self.B * self.T
 
-    def advance(self): # advance to next data shard
+    def advance(self):  # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
@@ -611,10 +637,10 @@ class DistributedShardedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
         buf = torch.tensor(buf, dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)  # targets
         # advance the start pointer in current shard
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds advance the shard
@@ -622,8 +648,10 @@ class DistributedShardedDataLoader:
             self.advance()
         return x, y
 
+
 # -----------------------------------------------------------------------------
 # int main
+
 
 def main(
     ckpt_dir: str = "llama-models/models/llama3_1/Meta-Llama-3.1-8B",
@@ -691,9 +719,10 @@ def main(
     t1 = time.time()
     print(f"Generated in {t1 - t0:.2f} seconds")
     for prompt, result in zip(prompts, results):
-        print(prompt, end="") # AK: change end="\n" to end=""
+        print(prompt, end="")  # AK: change end="\n" to end=""
         print(f"{result['generation']}")
         print("\n==================================\n")
+
 
 if __name__ == "__main__":
     fire.Fire(main)
